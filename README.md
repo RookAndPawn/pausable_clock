@@ -46,4 +46,4 @@ assert!((clock.now_std().elapsed().as_secs_f64() - 1.).abs() < 0.005);
 
 ## Caveats
 - We use an `AtomicU64` to contain the entire state of the pausable clock, so the granularity of the instant's produced by the clock is milliseconds. This means the maximum time the timer can handle is on the order of hundreds of thousands of years.
-- Reads of the pause state for `PausableClock::now` and `PausableClock::is_paused` are done atomically with `Ordering::Relaxed`. This allows those calls to be really fast, but it means you shouldn't think of them as fencing operations
+- Reads of the pause state for `PausableClock::is_paused` is done atomically with `Ordering::Relaxed`. That allows the call to be slightly faster, but it means you shouldn't think it as fencing a operations

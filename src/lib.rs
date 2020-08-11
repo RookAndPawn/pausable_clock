@@ -1,26 +1,27 @@
 //! # Pausable Clock
 //!
-//! This crate provides a clock that can be paused ... (duh?). The provided struct
-//! `PausableClock` allows you to get the current time in a way that respects the atomic
-//! state and history of the clock.  Put more simply, a pausable clock's elapsed
-//! time increases at the same as real time but only when the clock is resumed.
+//! This crate provides a clock that can be paused ... (duh?). The provided
+//! struct `PausableClock` allows you to get the current time in a way that
+//! respects the atomic state and history of the clock.  Put more simply, a
+//! pausable clock's elapsed time increases at the same as real time but only
+//! when the clock is resumed.
 //!
 //! ## Features
-//! - Thread-Safe: (`Send`/`Sync`) All operations on the clock are atomic or use std
-//! mutexes
-//! - Resume Notification: the `wait_for_resume` method will block until the clock is
-//! resumed (if the clock is paused)
-//! - Guarantees: Just like `std::time::Instant::now()` guarantees that [time always
-//! increases](https://doc.rust-lang.org/src/std/time.rs.html#238), `PausableClock`
-//! guarantees that the time returned by `clock.now()` while the clock is paused is >=
-//! any other instant returned before the clock was paused.
+//! - Thread-Safe: (`Send`/`Sync`) All operations on the clock are atomic or use
+//! std mutexes
+//! - Resume Notification: the `wait_for_resume` method will block until the
+//! clock is resumed (if the clock is paused)
+//! - Guarantees: Just like `std::time::Instant::now()` guarantees that [time
+//! always increases](https://doc.rust-lang.org/src/std/time.rs.html#238),
+//! `PausableClock` guarantees that the time returned by `clock.now()` while the
+//! clock is paused is >= any other instant returned before the clock was paused.
 //!
 //! ## Example
 //!
 //! ```rust
 //! # use std::sync::Arc;
 //! # use pausable_clock::PausableClock;
-//! # use std::time::Duration;
+//! # use std::time::{Duration, Instant};
 //! # use std::thread;
 //!
 //! let clock = Arc::new(PausableClock::default());
@@ -41,25 +42,27 @@
 //! });
 //!
 //! // Sleep for a sec, then resume the clock
+//! let sleep_start = Instant::now();
 //! thread::sleep(Duration::from_secs(1));
+//! let slept = sleep_start.elapsed().as_secs_f64();
+//!
 //! clock.resume();
 //!
 //! // Wait for the spawned thread to unblock
 //! t.join().unwrap();
 //!
 //! // After being paused for a second, the clock is now a second behind
-//! // (with a small error margin here because sleep is not super accurate)
-//! assert!((clock.now_std().elapsed().as_secs_f64() - 1.).abs() < 0.005);
+//! assert!((clock.now_std().elapsed().as_secs_f64() - slept).abs() <= 0.001);
 //! ```
 //!
 //! ## Caveats
-//! - We use an `AtomicU64` to contain the entire state of the pausable clock, so the
-//! granularity of the instant's produced by the clock is milliseconds. This means
-//! the maximum time the timer can handle is on the order of hundreds of thousands
-//! of years.
-//! - Reads of the pause state for `PausableClock::now` and `PausableClock::is_paused`
-//! are done atomically with `Ordering::Relaxed`. This allows those calls to be really
-//! fast, but it means you shouldn't think of them as fencing operations
+//! - We use an `AtomicU64` to contain the entire state of the pausable clock,
+//! so the granularity of the instant's produced by the clock is milliseconds.
+//! This means the maximum time the timer can handle is on the order of hundreds
+//! of thousands of years.
+//! - Reads of the pause state for `PausableClock::is_paused` is done atomically
+//! with `Ordering::Relaxed`. That allows the call to be slightly faster, but it
+//! means you shouldn't think it as fencing a operations
 #![warn(
     missing_docs,
     rust_2018_idioms,
@@ -151,7 +154,7 @@ impl Inner {
     /// instant that was used to create it.
     fn now(&self) -> (PausableInstant, Instant) {
         let now = Instant::now();
-        let state = self.current_state(Ordering::Relaxed);
+        let state = self.current_state(Ordering::Acquire);
 
         if state.is_read_time_frozen() {
             (
@@ -335,10 +338,13 @@ mod tests {
         assert!(clock.is_paused());
 
         let clock_clone = clock.clone();
+
         let j = thread::spawn(move || {
             let bef_real = Instant::now();
             let bef = clock_clone.now();
+
             clock_clone.wait_for_resume();
+
             let aft = clock_clone.now();
             let aft_real = Instant::now();
 
@@ -349,7 +355,9 @@ mod tests {
             assert!(elapsed_clock_millis <= 1);
         });
 
+        let now = Instant::now();
         thread::sleep(Duration::from_secs(1));
+        let slept_millis = now.elapsed().as_secs_f64();
 
         clock.resume();
 
@@ -359,9 +367,7 @@ mod tests {
 
         let elapsed = clock.now_std().elapsed();
 
-        dbg!(elapsed);
-
-        assert!((elapsed.as_secs_f64() - 1.).abs() < 0.005);
+        assert!((elapsed.as_secs_f64() - slept_millis).abs() <= 0.001);
     }
 
     #[test]
@@ -401,7 +407,7 @@ mod tests {
     fn test_time_max_when_paused() {
         let clock = Arc::new(PausableClock::default());
 
-        let threads = 10000;
+        let threads = 1000;
         let last_times: Arc<Vec<AtomicU64>> = Arc::new(
             std::iter::repeat_with(|| AtomicU64::default())
                 .take(threads)

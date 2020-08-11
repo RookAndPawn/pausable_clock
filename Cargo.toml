@@ -11,3 +11,10 @@ keywords = ["clock", "time", "simulation", "concurrent"]
 categories = ["concurrency", "date-and-time"]
 
 [dependencies]
+
+[dev-dependencies]
+criterion = "0.3"
+
+[[bench]]
+name = "now_bench"
+harness = false
