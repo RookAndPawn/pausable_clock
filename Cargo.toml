@@ -1,7 +1,13 @@
 [package]
-name = "pausable-clock"
+name = "pausable_clock"
 version = "0.1.0"
 authors = ["Kevin Guthrie <kevin.guthrie@gmail.com>"]
 edition = "2018"
+license = "MIT OR Apache-2.0"
+description = "A source of time information that can be paused and resumed"
+readme = "README.md"
+repository = "https://github.com/RookAndPawn/pausable_clock"
+keywords = ["clock", "time", "simulation", "concurrent"]
+categories = ["concurrency", "date-and-time"]
 
 [dependencies]
