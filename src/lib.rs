@@ -71,55 +71,20 @@
     clippy::all
 )]
 
+mod pausable_instant;
+mod pause_state;
+
 pub use pausable_instant::PausableInstant;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex};
+use pause_state::{PauseState, PauseStateTrait};
+use std::sync::atomic::{compiler_fence, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-mod pausable_instant;
-
-const PAUSED_MASK: u64 = 1 << 63;
-const PAUSING_MASK: u64 = 1 << 62;
-const FLAG_MASK: u64 = PAUSED_MASK + PAUSING_MASK;
-const ELAPSED_MILLIS_MASK: u64 = !FLAG_MASK;
-
-type PauseState = u64;
-
-trait PauseStateTrait {
-    fn new(paused: bool, pausing: bool, millis: u64) -> PauseState;
-
-    fn is_paused(&self) -> bool;
-
-    fn is_pausing(&self) -> bool;
-
-    fn get_millis(&self) -> u64;
-
-    fn is_read_time_frozen(&self) -> bool;
-}
-
-impl PauseStateTrait for PauseState {
-    fn new(paused: bool, pausing: bool, millis: u64) -> PauseState {
-        millis
-            + if paused { PAUSED_MASK } else { 0 }
-            + if pausing { PAUSING_MASK } else { 0 }
-    }
-
-    fn is_paused(&self) -> bool {
-        *self & PAUSED_MASK > 0
-    }
-
-    fn is_pausing(&self) -> bool {
-        *self & PAUSING_MASK > 0
-    }
-
-    fn get_millis(&self) -> u64 {
-        *self & ELAPSED_MILLIS_MASK
-    }
-
-    fn is_read_time_frozen(&self) -> bool {
-        *self & FLAG_MASK > 0
-    }
-}
+/// Source of time information that can be paused and resumed. At its heart it
+/// is a reference instant in real time, a record of elapsed time, and an atomic
+/// state stored in a u64
+#[derive(Debug, Clone)]
+pub struct PausableClock(Arc<WrappedPausableClock>);
 
 #[derive(Debug)]
 struct Inner {
@@ -127,11 +92,9 @@ struct Inner {
     pause_state: AtomicU64,
 }
 
-/// Source of time information that can be paused and resumed. At its heart it
-/// is a reference instant in real time, a record of elapsed time, and an atomic
-/// state stored in a u64
+#[allow(clippy::mutex_atomic)]
 #[derive(Debug)]
-pub struct PausableClock {
+pub(crate) struct WrappedPausableClock {
     inner: Inner,
     pause_lock: Mutex<bool>,
     resume_condition: Condvar,
@@ -154,7 +117,9 @@ impl Inner {
     /// instant that was used to create it.
     fn now(&self) -> (PausableInstant, Instant) {
         let now = Instant::now();
-        let state = self.current_state(Ordering::Acquire);
+        // Prevent compiler re-ordering here so time is not read after state
+        compiler_fence(Ordering::SeqCst);
+        let state = self.current_state(Ordering::Relaxed);
 
         if state.is_read_time_frozen() {
             (
@@ -186,6 +151,13 @@ impl Inner {
     }
 }
 
+impl WrappedPausableClock {
+    pub(crate) fn increment_pause_guards(&self) {}
+
+    pub(crate) fn decrement_pause_guards(&self) {}
+}
+
+#[allow(clippy::mutex_atomic)]
 impl PausableClock {
     /// Create a new pausable clock with the given pause state and the given
     /// elapsed time
@@ -196,7 +168,7 @@ impl PausableClock {
         let current_state =
             PauseState::new(true, false, elapsed_time.as_millis() as u64);
 
-        let result = PausableClock {
+        let result = PausableClock(Arc::new(WrappedPausableClock {
             inner: Inner {
                 zero_instant,
                 pause_state: AtomicU64::new(current_state),
@@ -204,7 +176,7 @@ impl PausableClock {
 
             pause_lock: Mutex::new(true),
             resume_condition: Condvar::default(),
-        };
+        }));
 
         if !paused {
             result.resume();
@@ -220,7 +192,7 @@ impl PausableClock {
 
     /// Get the current time according to the clock
     pub fn now(&self) -> PausableInstant {
-        self.inner.now().0
+        self.0.inner.now().0
     }
 
     /// Pause the pausable clock. This function will set the pause state to
@@ -233,9 +205,9 @@ impl PausableClock {
     /// this method was called.
     pub fn pause(&self) -> bool {
         let mut paused_guard =
-            self.pause_lock.lock().expect("Failed to get pause lock");
+            self.0.pause_lock.lock().expect("Failed to get pause lock");
 
-        let starting_state = self.inner.current_state(Ordering::SeqCst);
+        let starting_state = self.0.inner.current_state(Ordering::SeqCst);
 
         if starting_state.is_paused() {
             return false;
@@ -245,25 +217,25 @@ impl PausableClock {
             panic!("Inconsistent pause state: pausing");
         }
 
-        let (pausing_instant, real_time_at_pausing) = self.inner.now();
+        let (pausing_instant, real_time_at_pausing) = self.0.inner.now();
         let pausing =
             PauseState::new(false, true, pausing_instant.elapsed_millis);
-        self.inner.set_state(pausing);
+        self.0.inner.set_state(pausing);
 
         // Pretend to use the stored pausing instant as the input to resuming
         // fake_resume = now - zero - pausing
         let fake_resume_millis =
-            self.inner.millis_since_zero(real_time_at_pausing)
+            self.0.inner.millis_since_zero(real_time_at_pausing)
                 - pausing_instant.elapsed_millis;
 
-        let paused_millis = self.inner.zero_instant.elapsed().as_millis()
+        let paused_millis = self.0.inner.zero_instant.elapsed().as_millis()
             as u64
             - fake_resume_millis;
 
         let paused = PauseState::new(true, false, paused_millis);
 
         *paused_guard = true;
-        self.inner.set_state(paused);
+        self.0.inner.set_state(paused);
 
         true
     }
@@ -274,9 +246,9 @@ impl PausableClock {
     /// resumed. It will return false if the clock was already resumed
     pub fn resume(&self) -> bool {
         let mut paused_guard =
-            self.pause_lock.lock().expect("Failed to get pause lock");
+            self.0.pause_lock.lock().expect("Failed to get pause lock");
 
-        let starting_state = self.inner.current_state(Ordering::SeqCst);
+        let starting_state = self.0.inner.current_state(Ordering::SeqCst);
 
         if !starting_state.is_paused() {
             return false;
@@ -289,22 +261,22 @@ impl PausableClock {
         // now - stored - zero = paused_millis
         // stored = now - paused_millis - zero
         let paused_millis = starting_state.get_millis();
-        let stored_millis = self.inner.zero_instant.elapsed().as_millis()
+        let stored_millis = self.0.inner.zero_instant.elapsed().as_millis()
             as u64
             - paused_millis;
         let resumed_state = PauseState::new(false, false, stored_millis);
 
         *paused_guard = false;
 
-        self.inner.set_state(resumed_state);
-        self.resume_condition.notify_all();
+        self.0.inner.set_state(resumed_state);
+        self.0.resume_condition.notify_all();
 
         true
     }
 
     /// Check to see if the clock is paused
     pub fn is_paused(&self) -> bool {
-        self.inner.is_paused(Ordering::Relaxed)
+        self.0.inner.is_paused(Ordering::Relaxed)
     }
 
     /// Block the current thread until the clock resumes. If the clock is not
@@ -315,8 +287,8 @@ impl PausableClock {
             return;
         }
 
-        let guard = self.pause_lock.lock().expect("Unable to get pause lock");
-        let _lock = self.resume_condition.wait_while(guard, |p| *p);
+        let guard = self.0.pause_lock.lock().expect("Unable to get pause lock");
+        let _lock = self.0.resume_condition.wait_while(guard, |p| *p);
     }
 }
 
