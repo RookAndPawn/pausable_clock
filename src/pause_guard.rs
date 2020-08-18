@@ -1,14 +1,15 @@
-use std::sync::{ Weak, Arc };
+use super::WrappedPausableClock;
+use std::sync::{Arc, Weak};
 
 pub struct PauseGuard {
-    owner: Weak<WrappedPausableClock>
+    owner: Weak<WrappedPausableClock>,
 }
 
 impl PauseGuard {
-    pub(crate) fn new(owner: Arc<WrappedPausableClock>) {
+    pub(crate) fn new(owner: &Arc<WrappedPausableClock>) -> PauseGuard {
         let result = PauseGuard {
-            owner: Arc::downgrade(&owner);
-        }
+            owner: Arc::downgrade(owner),
+        };
 
         owner.increment_pause_guards();
 

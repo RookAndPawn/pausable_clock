@@ -72,12 +72,14 @@
 )]
 
 mod pausable_instant;
+mod pause_guard;
 mod pause_state;
 
 pub use pausable_instant::PausableInstant;
+use pause_guard::PauseGuard;
 use pause_state::{PauseState, PauseStateTrait};
-use std::sync::atomic::{compiler_fence, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{compiler_fence, fence, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 /// Source of time information that can be paused and resumed. At its heart it
@@ -96,6 +98,7 @@ struct Inner {
 #[derive(Debug)]
 pub(crate) struct WrappedPausableClock {
     inner: Inner,
+    guard_count: AtomicU64,
     pause_lock: Mutex<bool>,
     resume_condition: Condvar,
 }
@@ -121,7 +124,7 @@ impl Inner {
         compiler_fence(Ordering::SeqCst);
         let state = self.current_state(Ordering::Relaxed);
 
-        if state.is_read_time_frozen() {
+        if state.is_paused_or_pausing() {
             (
                 PausableInstant::new(self.zero_instant, state.get_millis()),
                 now,
@@ -146,15 +149,30 @@ impl Inner {
         self.current_state(ordering).is_paused()
     }
 
+    fn is_pausing(&self, ordering: Ordering) -> bool {
+        self.current_state(ordering).is_pausing()
+    }
+
+    fn is_paused_or_pausing(&self, ordering: Ordering) -> bool {
+        self.current_state(ordering).is_paused_or_pausing()
+    }
+
     fn millis_since_zero(&self, instant: Instant) -> u64 {
         (instant - self.zero_instant).as_millis() as u64
     }
 }
 
 impl WrappedPausableClock {
-    pub(crate) fn increment_pause_guards(&self) {}
+    pub(crate) fn increment_pause_guards(&self) {
+        self.guard_count.fetch_add(1, Ordering::Relaxed);
+    }
 
-    pub(crate) fn decrement_pause_guards(&self) {}
+    pub(crate) fn decrement_pause_guards(&self) {
+        if self.guard_count.fetch_sub(1, Ordering::Release) == 1 {
+            fence(Ordering::Acquire);
+            self.resume_condition.notify_all();
+        }
+    }
 }
 
 #[allow(clippy::mutex_atomic)]
@@ -174,6 +192,7 @@ impl PausableClock {
                 pause_state: AtomicU64::new(current_state),
             },
 
+            guard_count: Default::default(),
             pause_lock: Mutex::new(true),
             resume_condition: Condvar::default(),
         }));
@@ -279,16 +298,52 @@ impl PausableClock {
         self.0.inner.is_paused(Ordering::Relaxed)
     }
 
+    /// Check to see if the clock is pausing. Note that a clock that is paused
+    /// will not be pausing
+    pub fn is_pausing(&self) -> bool {
+        self.0.inner.is_pausing(Ordering::Relaxed)
+    }
+
+    /// Check to see if the clock is paused
+    pub fn is_paused_or_pausing(&self) -> bool {
+        self.0.inner.is_paused_or_pausing(Ordering::Relaxed)
+    }
+
+    fn wait_for_pause(&self) -> MutexGuard<'_, bool> {
+        let guard = self.0.pause_lock.lock().expect("Unable to get pause lock");
+        if self.is_paused() {
+            return guard;
+        }
+
+        self.0
+            .resume_condition
+            .wait_while(guard, |p| !*p)
+            .expect("Expected successful wait until pause")
+    }
+
     /// Block the current thread until the clock resumes. If the clock is not
     /// paused when this method is called, the method will return without
     /// blocking
-    pub fn wait_for_resume(&self) {
-        if !self.is_paused() {
-            return;
+    pub fn wait_for_resume(&self) -> PauseGuard {
+        if !self.is_paused_or_pausing() {
+            return PauseGuard::new(&self.0);
         }
 
-        let guard = self.0.pause_lock.lock().expect("Unable to get pause lock");
+        let guard = self.wait_for_pause();
+
+        let result = PauseGuard::new(&self.0);
+
         let _lock = self.0.resume_condition.wait_while(guard, |p| *p);
+
+        result
+    }
+
+    pub fn run_unpausable<F, T>(&self, action: F) -> T
+    where
+        F: FnOnce() -> T,
+    {
+        let _guard = self.wait_for_resume();
+        action()
     }
 }
 

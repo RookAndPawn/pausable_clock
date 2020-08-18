@@ -14,7 +14,7 @@ pub(crate) trait PauseStateTrait {
 
     fn get_millis(&self) -> u64;
 
-    fn is_read_time_frozen(&self) -> bool;
+    fn is_paused_or_pausing(&self) -> bool;
 }
 
 impl PauseStateTrait for PauseState {
@@ -36,7 +36,7 @@ impl PauseStateTrait for PauseState {
         *self & ELAPSED_MILLIS_MASK
     }
 
-    fn is_read_time_frozen(&self) -> bool {
+    fn is_paused_or_pausing(&self) -> bool {
         *self & FLAG_MASK > 0
     }
 }
