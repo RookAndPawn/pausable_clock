@@ -71,20 +71,20 @@
     clippy::all
 )]
 
+mod pausability_state;
 mod pausable_instant;
-mod pause_guard;
-mod pause_guard_state;
 mod pause_state;
+mod unpausable_task_guard;
 
-pub use pausable_instant::PausableInstant;
-use pause_guard::PauseGuard;
-use pause_guard_state::{
-    PauseGuardState, PauseGuardStateTrait, PAUSING_REQUESTED_MASK,
+use pausability_state::{
+    PausabilityState, PausabilityStateTrait, PAUSING_REQUESTED_MASK,
 };
+pub use pausable_instant::PausableInstant;
 use pause_state::{PauseState, PauseStateTrait};
-use std::sync::atomic::{compiler_fence, AtomicU64, AtomicU32, Ordering};
+use std::sync::atomic::{compiler_fence, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+use unpausable_task_guard::UnpausableTaskGuard;
 
 /// Enumeration of the possible pause states of the system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -94,12 +94,12 @@ enum CoursePauseState {
     Resumed,
 }
 
-/// Enumeration of the possible states of the pause guard. Normally this is
+/// Enumeration of the possible states of pausability. Normally this is
 /// Unused. During a pause call it gets set to Pausing, and if there are
 /// un-pausable tasks running when the pause call happens, they will set the
 /// state to released.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum CoursePauseGuardState {
+enum CoursePausabilityState {
     Unused,
     Pausing,
     Released,
@@ -116,9 +116,9 @@ pub struct PausableClock {
     pause_state_lock: Mutex<CoursePauseState>,
     pause_state_condition: Condvar,
 
-    pause_guard_state: AtomicU32,
-    pause_guard_lock: Mutex<CoursePauseGuardState>,
-    pause_guard_condition: Condvar,
+    pausability_state: AtomicU32,
+    pausability_lock: Mutex<CoursePausabilityState>,
+    pausability_condition: Condvar,
 }
 
 /// The default pausable clock is one that is (more or less) identical to real
@@ -146,9 +146,9 @@ impl PausableClock {
             pause_state_lock: Mutex::new(CoursePauseState::Paused),
             pause_state_condition: Condvar::default(),
 
-            pause_guard_state: Default::default(),
-            pause_guard_lock: Mutex::new(CoursePauseGuardState::Unused),
-            pause_guard_condition: Default::default(),
+            pausability_state: Default::default(),
+            pausability_lock: Mutex::new(CoursePausabilityState::Unused),
+            pausability_condition: Default::default(),
         };
 
         if !paused {
@@ -193,24 +193,24 @@ impl PausableClock {
         *paused_guard = CoursePauseState::Pausing;
 
         {
-            let mut pausable_guard = self
-                .pause_guard_lock
+            let mut pausability_guard = self
+                .pausability_lock
                 .lock()
                 .expect("Failed to get pause guard lock");
-            if *pausable_guard != CoursePauseGuardState::Unused {
+            if *pausability_guard != CoursePausabilityState::Unused {
                 panic!("Inconsistent pausable state");
             }
-            *pausable_guard = CoursePauseGuardState::Pausing;
+            *pausability_guard = CoursePausabilityState::Pausing;
         }
 
         let starting_state = self.current_state(Ordering::SeqCst);
         let pausing = starting_state.with_pausing_flag();
 
         self.set_state(pausing);
-        let pause_guard_state = self.set_pausing_flag_on_guard_state();
+        let pausability_state = self.set_pausing_flag_on_guard_state();
 
-        if pause_guard_state.get_pause_guard_count() > 0 {
-            self.wait_for_pause_guards_to_clear();
+        if pausability_state.get_unpausable_task_count() > 0 {
+            self.wait_for_unpausable_tasks_to_clear();
         }
 
         let (freeze_instant, real_time_at_freeze) = self.now_impl();
@@ -239,12 +239,12 @@ impl PausableClock {
         self.unset_pausing_flag_on_guard_state();
 
         {
-            let mut pause_guard_lock = self
-                .pause_guard_lock
+            let mut unpausable_task_guard_lock = self
+                .pausability_lock
                 .lock()
                 .expect("Failed to get pause guard lock");
 
-            *pause_guard_lock = CoursePauseGuardState::Unused;
+            *unpausable_task_guard_lock = CoursePausabilityState::Unused;
         }
 
         true
@@ -252,17 +252,18 @@ impl PausableClock {
 
     /// Wait on the pausable guard condition to make sure all valid pause guards
     /// have exited before allowing the pause action to proceed
-    fn wait_for_pause_guards_to_clear(&self) {
-        let pause_guard_lock = self
-            .pause_guard_lock
+    fn wait_for_unpausable_tasks_to_clear(&self) {
+        let unpausable_task_guard_lock = self
+            .pausability_lock
             .lock()
             .expect("Failed to get pause guard lock");
 
-        let _ = self
-            .pause_guard_condition
-            .wait_while(pause_guard_lock, |s| {
-                *s != CoursePauseGuardState::Released
-            });
+        let _lock = self
+            .pausability_condition
+            .wait_while(unpausable_task_guard_lock, |s| {
+                *s != CoursePausabilityState::Released
+            })
+            .expect("Expected valid return from pausability lock");
     }
 
     /// Resume the clock and notify any threads waiting on for time to resume.
@@ -320,10 +321,14 @@ impl PausableClock {
     /// Block the current thread until the clock resumes. If the clock is not
     /// paused when this method is called, the method will return without
     /// blocking
+    #[allow(clippy::let_underscore_lock)]
     pub fn wait_for_resume(&self) {
         let _ = self.wait_for_resume_impl();
     }
 
+    /// Wait for the clock to resume, or if the clock is already resumed, do
+    /// nothing. The return for this function is none if no waiting was done,
+    /// and a mutex guard on the pause state if waiting was done.
     fn wait_for_resume_impl(&self) -> Option<MutexGuard<'_, CoursePauseState>> {
         if !self.is_paused_or_pausing_ordered(Ordering::Acquire) {
             return None;
@@ -351,10 +356,8 @@ impl PausableClock {
         F: FnOnce() -> T,
     {
         // This does a _Acquire_ read and _Relaxed_ write
-        let guard_opt = match PauseGuard::try_lock(self) {
-
+        let guard_opt = match UnpausableTaskGuard::try_lock(self) {
             Ok(guard) => {
-
                 // Another _Acquire_ read here that definitely happens after the
                 // read of the pause guard state
                 let pause_state = self.current_state(Ordering::Acquire);
@@ -385,9 +388,9 @@ impl PausableClock {
             // If wait for pause was able to return a lock on the pause state,
             // we can use that to create an infallible pause guard
             if guard_opt.is_some() {
-                let _pause_guard = {
+                let _unpausable_task_guard = {
                     let _active_guard = guard_opt.take();
-                    PauseGuard::try_lock(self)
+                    UnpausableTaskGuard::try_lock(self)
                 };
                 action()
             } else {
@@ -426,14 +429,14 @@ impl PausableClock {
         }
     }
 
-    fn set_pausing_flag_on_guard_state(&self) -> PauseGuardState {
-        self.pause_guard_state
+    fn set_pausing_flag_on_guard_state(&self) -> PausabilityState {
+        self.pausability_state
             .fetch_or(PAUSING_REQUESTED_MASK, Ordering::AcqRel)
             | PAUSING_REQUESTED_MASK
     }
 
-    fn unset_pausing_flag_on_guard_state(&self) -> PauseGuardState {
-        self.pause_guard_state
+    fn unset_pausing_flag_on_guard_state(&self) -> PausabilityState {
+        self.pausability_state
             .fetch_and(!PAUSING_REQUESTED_MASK, Ordering::AcqRel)
             & (!PAUSING_REQUESTED_MASK)
     }
@@ -463,25 +466,26 @@ impl PausableClock {
         (instant - self.zero_instant).as_millis() as u64
     }
 
-    pub(crate) fn increment_pause_guards(&self) -> PauseGuardState {
-        self.pause_guard_state.fetch_add(1, Ordering::Acquire) + 1
+    pub(crate) fn increment_unpausable_task_guards(&self) -> PausabilityState {
+        self.pausability_state.fetch_add(1, Ordering::Acquire) + 1
     }
 
-    pub(crate) fn decrement_pause_guards(&self) -> PauseGuardState {
-        let result = self.pause_guard_state.fetch_sub(1, Ordering::Acquire) - 1;
+    pub(crate) fn decrement_unpausable_task_guards(&self) -> PausabilityState {
+        let result = self.pausability_state.fetch_sub(1, Ordering::Acquire) - 1;
 
-        if result.get_pause_guard_count() == 0 && result.is_pausing_requested()
+        if result.get_unpausable_task_count() == 0
+            && result.is_pausing_requested()
         {
             {
-                let mut pausable_guard = self
-                    .pause_guard_lock
+                let mut pausability_guard = self
+                    .pausability_lock
                     .lock()
                     .expect("Failed to get pause guard lock");
-                if *pausable_guard == CoursePauseGuardState::Pausing {
-                    *pausable_guard = CoursePauseGuardState::Released;
+                if *pausability_guard == CoursePausabilityState::Pausing {
+                    *pausability_guard = CoursePausabilityState::Released;
                 }
             }
-            self.pause_guard_condition.notify_all();
+            self.pausability_condition.notify_all();
         }
 
         result
