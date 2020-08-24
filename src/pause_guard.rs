@@ -1,26 +1,26 @@
-use super::WrappedPausableClock;
-use std::sync::{Arc, Weak};
+use super::PausableClock;
+use super::PauseGuardStateTrait;
 
-pub struct PauseGuard {
-    owner: Weak<WrappedPausableClock>,
-}
+pub(super) struct PauseGuard<'a>(&'a PausableClock);
 
-impl PauseGuard {
-    pub(crate) fn new(owner: &Arc<WrappedPausableClock>) -> PauseGuard {
-        let result = PauseGuard {
-            owner: Arc::downgrade(owner),
-        };
+impl<'a> PauseGuard<'a> {
+    pub(crate) fn try_lock(
+        owner: &'a PausableClock,
+    ) -> Result<PauseGuard<'a>, ()> {
+        let result = PauseGuard(owner);
 
-        owner.increment_pause_guards();
+        let new_guard_state = owner.increment_pause_guards();
 
-        result
+        if new_guard_state.is_pausing_requested() {
+            Err(())
+        } else {
+            Ok(result)
+        }
     }
 }
 
-impl Drop for PauseGuard {
+impl<'a> Drop for PauseGuard<'a> {
     fn drop(&mut self) {
-        if let Some(owner) = self.owner.upgrade() {
-            owner.decrement_pause_guards();
-        }
+        let _ = self.0.decrement_pause_guards();
     }
 }

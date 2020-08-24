@@ -73,34 +73,52 @@
 
 mod pausable_instant;
 mod pause_guard;
+mod pause_guard_state;
 mod pause_state;
 
 pub use pausable_instant::PausableInstant;
 use pause_guard::PauseGuard;
+use pause_guard_state::{
+    PauseGuardState, PauseGuardStateTrait, PAUSING_REQUESTED_MASK,
+};
 use pause_state::{PauseState, PauseStateTrait};
-use std::sync::atomic::{compiler_fence, fence, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::atomic::{compiler_fence, AtomicU64, AtomicU32, Ordering};
+use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+
+/// Enumeration of the possible pause states of the system.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CoursePauseState {
+    Paused,
+    Pausing,
+    Resumed,
+}
+
+/// Enumeration of the possible states of the pause guard. Normally this is
+/// Unused. During a pause call it gets set to Pausing, and if there are
+/// un-pausable tasks running when the pause call happens, they will set the
+/// state to released.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CoursePauseGuardState {
+    Unused,
+    Pausing,
+    Released,
+}
 
 /// Source of time information that can be paused and resumed. At its heart it
 /// is a reference instant in real time, a record of elapsed time, and an atomic
 /// state stored in a u64
-#[derive(Debug, Clone)]
-pub struct PausableClock(Arc<WrappedPausableClock>);
-
 #[derive(Debug)]
-struct Inner {
+pub struct PausableClock {
     zero_instant: Instant,
-    pause_state: AtomicU64,
-}
 
-#[allow(clippy::mutex_atomic)]
-#[derive(Debug)]
-pub(crate) struct WrappedPausableClock {
-    inner: Inner,
-    guard_count: AtomicU64,
-    pause_lock: Mutex<bool>,
-    resume_condition: Condvar,
+    pause_state: AtomicU64,
+    pause_state_lock: Mutex<CoursePauseState>,
+    pause_state_condition: Condvar,
+
+    pause_guard_state: AtomicU32,
+    pause_guard_lock: Mutex<CoursePauseGuardState>,
+    pause_guard_condition: Condvar,
 }
 
 /// The default pausable clock is one that is (more or less) identical to real
@@ -111,20 +129,287 @@ impl Default for PausableClock {
     }
 }
 
-impl Inner {
+impl PausableClock {
+    /// Create a new pausable clock with the given pause state and the given
+    /// elapsed time
+    pub fn new(elapsed_time: Duration, paused: bool) -> PausableClock {
+        let now = Instant::now();
+        let zero_instant = now - elapsed_time;
+
+        let current_state =
+            PauseState::new(true, false, true, elapsed_time.as_millis() as u64);
+
+        let result = PausableClock {
+            zero_instant,
+            pause_state: AtomicU64::new(current_state),
+
+            pause_state_lock: Mutex::new(CoursePauseState::Paused),
+            pause_state_condition: Condvar::default(),
+
+            pause_guard_state: Default::default(),
+            pause_guard_lock: Mutex::new(CoursePauseGuardState::Unused),
+            pause_guard_condition: Default::default(),
+        };
+
+        if !paused {
+            result.resume();
+        }
+
+        result
+    }
+
+    /// Get the current time according to this clock as a std instant
+    pub fn now_std(&self) -> Instant {
+        self.now().into()
+    }
+
+    /// Get the current time according to the clock
+    pub fn now(&self) -> PausableInstant {
+        self.now_impl().0
+    }
+
+    /// Pause the pausable clock. This function will set the pause state to
+    /// pausing, then to paused. This ensures that no times will be read in
+    /// the time between when now is read and when the pause state is set that
+    /// is greater than the paused time.
+    ///
+    /// True will be returned for a successful pause (meaning the clock wasn't
+    /// already paused), and false will be returned if the clock was paused when
+    /// this method was called.
+    pub fn pause(&self) -> bool {
+        let mut paused_guard = self
+            .pause_state_lock
+            .lock()
+            .expect("Failed to get pause lock");
+
+        match *paused_guard {
+            CoursePauseState::Paused => return false,
+            CoursePauseState::Pausing => {
+                panic!("Inconsistent pause state");
+            }
+            _ => {}
+        }
+
+        *paused_guard = CoursePauseState::Pausing;
+
+        {
+            let mut pausable_guard = self
+                .pause_guard_lock
+                .lock()
+                .expect("Failed to get pause guard lock");
+            if *pausable_guard != CoursePauseGuardState::Unused {
+                panic!("Inconsistent pausable state");
+            }
+            *pausable_guard = CoursePauseGuardState::Pausing;
+        }
+
+        let starting_state = self.current_state(Ordering::SeqCst);
+        let pausing = starting_state.with_pausing_flag();
+
+        self.set_state(pausing);
+        let pause_guard_state = self.set_pausing_flag_on_guard_state();
+
+        if pause_guard_state.get_pause_guard_count() > 0 {
+            self.wait_for_pause_guards_to_clear();
+        }
+
+        let (freeze_instant, real_time_at_freeze) = self.now_impl();
+
+        // Freeze time at the given instant, but to prevent times ahead of pause
+        // we don't consider the clock to be paused yet
+        self.set_state(PauseState::new(
+            false,
+            true,
+            true,
+            freeze_instant.elapsed_millis,
+        ));
+
+        // Pretend to use the stored pausing instant as the input to resuming
+        // fake_resume = now - zero - pausing
+        let fake_resume_millis = self.millis_since_zero(real_time_at_freeze)
+            - freeze_instant.elapsed_millis;
+
+        let frozen_millis =
+            self.zero_instant.elapsed().as_millis() as u64 - fake_resume_millis;
+
+        let paused = PauseState::new(true, false, true, frozen_millis);
+
+        *paused_guard = CoursePauseState::Paused;
+        self.set_state(paused);
+        self.unset_pausing_flag_on_guard_state();
+
+        {
+            let mut pause_guard_lock = self
+                .pause_guard_lock
+                .lock()
+                .expect("Failed to get pause guard lock");
+
+            *pause_guard_lock = CoursePauseGuardState::Unused;
+        }
+
+        true
+    }
+
+    /// Wait on the pausable guard condition to make sure all valid pause guards
+    /// have exited before allowing the pause action to proceed
+    fn wait_for_pause_guards_to_clear(&self) {
+        let pause_guard_lock = self
+            .pause_guard_lock
+            .lock()
+            .expect("Failed to get pause guard lock");
+
+        let _ = self
+            .pause_guard_condition
+            .wait_while(pause_guard_lock, |s| {
+                *s != CoursePauseGuardState::Released
+            });
+    }
+
+    /// Resume the clock and notify any threads waiting on for time to resume.
+    ///
+    /// This will return true if the clock started paused and was successfully
+    /// resumed. It will return false if the clock was already resumed
+    pub fn resume(&self) -> bool {
+        let mut paused_guard = self
+            .pause_state_lock
+            .lock()
+            .expect("Failed to get pause lock");
+
+        let starting_state = self.current_state(Ordering::SeqCst);
+
+        if !starting_state.is_paused() {
+            return false;
+        }
+
+        if starting_state.is_pausing() {
+            panic!("Inconsistent pause state: pausing");
+        }
+
+        // now - stored - zero = paused_millis
+        // stored = now - paused_millis - zero
+        let paused_millis = starting_state.get_millis();
+        let stored_millis =
+            self.zero_instant.elapsed().as_millis() as u64 - paused_millis;
+        let resumed_state = PauseState::new(false, false, false, stored_millis);
+
+        *paused_guard = CoursePauseState::Resumed;
+
+        self.set_state(resumed_state);
+        self.pause_state_condition.notify_all();
+
+        true
+    }
+
+    /// Check to see if the clock is paused using relaxed atomic ordering
+    pub fn is_paused(&self) -> bool {
+        self.is_paused_ordered(Ordering::Relaxed)
+    }
+
+    /// Check to see if the clock is pausing using relaxed atomic ordering. Note
+    /// that a clock that is paused will not be pausing
+    pub fn is_pausing(&self) -> bool {
+        self.is_pausing_ordered(Ordering::Relaxed)
+    }
+
+    /// Check to see if the clock is paused or pausing using relaxed atomic
+    /// ordering
+    pub fn is_paused_or_pausing(&self) -> bool {
+        self.is_paused_or_pausing_ordered(Ordering::Relaxed)
+    }
+
+    /// Block the current thread until the clock resumes. If the clock is not
+    /// paused when this method is called, the method will return without
+    /// blocking
+    pub fn wait_for_resume(&self) {
+        let _ = self.wait_for_resume_impl();
+    }
+
+    fn wait_for_resume_impl(&self) -> Option<MutexGuard<'_, CoursePauseState>> {
+        if !self.is_paused_or_pausing_ordered(Ordering::Acquire) {
+            return None;
+        }
+
+        let guard = self
+            .pause_state_lock
+            .lock()
+            .expect("Failed to get pause-state lock");
+
+        let guard = self
+            .pause_state_condition
+            .wait_while(guard, |p| *p != CoursePauseState::Resumed)
+            .expect("Failed to reacquire lock on pause state after resume");
+
+        Some(guard)
+    }
+
+    /// This method provides a way to run in coordination with the pause
+    /// functionality of the clock. A task run with this method will prevent
+    /// the clock from being paused, and will not be run while the clock is
+    /// paused
+    pub fn run_unpausable<F, T>(&self, action: F) -> T
+    where
+        F: FnOnce() -> T,
+    {
+        // This does a _Acquire_ read and _Relaxed_ write
+        let guard_opt = match PauseGuard::try_lock(self) {
+
+            Ok(guard) => {
+
+                // Another _Acquire_ read here that definitely happens after the
+                // read of the pause guard state
+                let pause_state = self.current_state(Ordering::Acquire);
+                if pause_state.is_paused() {
+                    // Paused means we couldn't get a guard, but no need to
+                    // release the pausable lock
+                    None
+                } else if pause_state.is_pausing() {
+                    // Pausing means we interrupted the pausing process. We
+                    // can't keep the guard we have, and we need to ensure the
+                    // pausing process is notified when this guard is dropped.
+                    // we do that by setting the pausing flag on the guard state
+                    // ourselves
+                    self.set_pausing_flag_on_guard_state();
+                    None
+                } else {
+                    Some(guard)
+                }
+            }
+            _ => None,
+        };
+
+        if let Some(_guard) = guard_opt {
+            action()
+        } else {
+            let mut guard_opt = self.wait_for_resume_impl();
+
+            // If wait for pause was able to return a lock on the pause state,
+            // we can use that to create an infallible pause guard
+            if guard_opt.is_some() {
+                let _pause_guard = {
+                    let _active_guard = guard_opt.take();
+                    PauseGuard::try_lock(self)
+                };
+                action()
+            } else {
+                // otherwise we have to start over
+                self.run_unpausable(action)
+            }
+        }
+    }
+
     fn current_state(&self, ordering: Ordering) -> PauseState {
         self.pause_state.load(ordering)
     }
 
     /// Get a tuple of the current pausable instant and the associated real
     /// instant that was used to create it.
-    fn now(&self) -> (PausableInstant, Instant) {
+    fn now_impl(&self) -> (PausableInstant, Instant) {
         let now = Instant::now();
         // Prevent compiler re-ordering here so time is not read after state
         compiler_fence(Ordering::SeqCst);
         let state = self.current_state(Ordering::Relaxed);
 
-        if state.is_paused_or_pausing() {
+        if state.is_time_paused() {
             (
                 PausableInstant::new(self.zero_instant, state.get_millis()),
                 now,
@@ -141,209 +426,65 @@ impl Inner {
         }
     }
 
+    fn set_pausing_flag_on_guard_state(&self) -> PauseGuardState {
+        self.pause_guard_state
+            .fetch_or(PAUSING_REQUESTED_MASK, Ordering::AcqRel)
+            | PAUSING_REQUESTED_MASK
+    }
+
+    fn unset_pausing_flag_on_guard_state(&self) -> PauseGuardState {
+        self.pause_guard_state
+            .fetch_and(!PAUSING_REQUESTED_MASK, Ordering::AcqRel)
+            & (!PAUSING_REQUESTED_MASK)
+    }
+
     fn set_state(&self, new_state: PauseState) {
         self.pause_state.store(new_state, Ordering::SeqCst)
     }
 
-    fn is_paused(&self, ordering: Ordering) -> bool {
+    /// Check to see if the clock is paused using the given atomic ordering
+    pub fn is_paused_ordered(&self, ordering: Ordering) -> bool {
         self.current_state(ordering).is_paused()
     }
 
-    fn is_pausing(&self, ordering: Ordering) -> bool {
+    /// Check to see if the clock is pausing using the given atomic ordering.
+    /// Note that a clock that is paused will not be pausing
+    pub fn is_pausing_ordered(&self, ordering: Ordering) -> bool {
         self.current_state(ordering).is_pausing()
     }
 
-    fn is_paused_or_pausing(&self, ordering: Ordering) -> bool {
+    /// Check to see if the clock is paused or pausing using the given atomic
+    /// ordering
+    pub fn is_paused_or_pausing_ordered(&self, ordering: Ordering) -> bool {
         self.current_state(ordering).is_paused_or_pausing()
     }
 
     fn millis_since_zero(&self, instant: Instant) -> u64 {
         (instant - self.zero_instant).as_millis() as u64
     }
-}
 
-impl WrappedPausableClock {
-    pub(crate) fn increment_pause_guards(&self) {
-        self.guard_count.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn increment_pause_guards(&self) -> PauseGuardState {
+        self.pause_guard_state.fetch_add(1, Ordering::Acquire) + 1
     }
 
-    pub(crate) fn decrement_pause_guards(&self) {
-        if self.guard_count.fetch_sub(1, Ordering::Release) == 1 {
-            fence(Ordering::Acquire);
-            self.resume_condition.notify_all();
-        }
-    }
-}
+    pub(crate) fn decrement_pause_guards(&self) -> PauseGuardState {
+        let result = self.pause_guard_state.fetch_sub(1, Ordering::Acquire) - 1;
 
-#[allow(clippy::mutex_atomic)]
-impl PausableClock {
-    /// Create a new pausable clock with the given pause state and the given
-    /// elapsed time
-    pub fn new(elapsed_time: Duration, paused: bool) -> PausableClock {
-        let now = Instant::now();
-        let zero_instant = now - elapsed_time;
-
-        let current_state =
-            PauseState::new(true, false, elapsed_time.as_millis() as u64);
-
-        let result = PausableClock(Arc::new(WrappedPausableClock {
-            inner: Inner {
-                zero_instant,
-                pause_state: AtomicU64::new(current_state),
-            },
-
-            guard_count: Default::default(),
-            pause_lock: Mutex::new(true),
-            resume_condition: Condvar::default(),
-        }));
-
-        if !paused {
-            result.resume();
+        if result.get_pause_guard_count() == 0 && result.is_pausing_requested()
+        {
+            {
+                let mut pausable_guard = self
+                    .pause_guard_lock
+                    .lock()
+                    .expect("Failed to get pause guard lock");
+                if *pausable_guard == CoursePauseGuardState::Pausing {
+                    *pausable_guard = CoursePauseGuardState::Released;
+                }
+            }
+            self.pause_guard_condition.notify_all();
         }
 
         result
-    }
-
-    /// Get the current time according to this clock as a std instant
-    pub fn now_std(&self) -> Instant {
-        self.now().into()
-    }
-
-    /// Get the current time according to the clock
-    pub fn now(&self) -> PausableInstant {
-        self.0.inner.now().0
-    }
-
-    /// Pause the pausable clock. This function will set the pause state to
-    /// pausing, then to paused. This ensures that no times will be read in
-    /// the time between when now is read and when the pause state is set that
-    /// is greater than the paused time.
-    ///
-    /// True will be returned for a successful pause (meaning the clock wasn't
-    /// already paused), and false will be returned if the clock was paused when
-    /// this method was called.
-    pub fn pause(&self) -> bool {
-        let mut paused_guard =
-            self.0.pause_lock.lock().expect("Failed to get pause lock");
-
-        let starting_state = self.0.inner.current_state(Ordering::SeqCst);
-
-        if starting_state.is_paused() {
-            return false;
-        }
-
-        if starting_state.is_pausing() {
-            panic!("Inconsistent pause state: pausing");
-        }
-
-        let (pausing_instant, real_time_at_pausing) = self.0.inner.now();
-        let pausing =
-            PauseState::new(false, true, pausing_instant.elapsed_millis);
-        self.0.inner.set_state(pausing);
-
-        // Pretend to use the stored pausing instant as the input to resuming
-        // fake_resume = now - zero - pausing
-        let fake_resume_millis =
-            self.0.inner.millis_since_zero(real_time_at_pausing)
-                - pausing_instant.elapsed_millis;
-
-        let paused_millis = self.0.inner.zero_instant.elapsed().as_millis()
-            as u64
-            - fake_resume_millis;
-
-        let paused = PauseState::new(true, false, paused_millis);
-
-        *paused_guard = true;
-        self.0.inner.set_state(paused);
-
-        true
-    }
-
-    /// Resume the clock and notify any threads waiting on for time to resume.
-    ///
-    /// This will return true if the clock started paused and was successfully
-    /// resumed. It will return false if the clock was already resumed
-    pub fn resume(&self) -> bool {
-        let mut paused_guard =
-            self.0.pause_lock.lock().expect("Failed to get pause lock");
-
-        let starting_state = self.0.inner.current_state(Ordering::SeqCst);
-
-        if !starting_state.is_paused() {
-            return false;
-        }
-
-        if starting_state.is_pausing() {
-            panic!("Inconsistent pause state: pausing");
-        }
-
-        // now - stored - zero = paused_millis
-        // stored = now - paused_millis - zero
-        let paused_millis = starting_state.get_millis();
-        let stored_millis = self.0.inner.zero_instant.elapsed().as_millis()
-            as u64
-            - paused_millis;
-        let resumed_state = PauseState::new(false, false, stored_millis);
-
-        *paused_guard = false;
-
-        self.0.inner.set_state(resumed_state);
-        self.0.resume_condition.notify_all();
-
-        true
-    }
-
-    /// Check to see if the clock is paused
-    pub fn is_paused(&self) -> bool {
-        self.0.inner.is_paused(Ordering::Relaxed)
-    }
-
-    /// Check to see if the clock is pausing. Note that a clock that is paused
-    /// will not be pausing
-    pub fn is_pausing(&self) -> bool {
-        self.0.inner.is_pausing(Ordering::Relaxed)
-    }
-
-    /// Check to see if the clock is paused
-    pub fn is_paused_or_pausing(&self) -> bool {
-        self.0.inner.is_paused_or_pausing(Ordering::Relaxed)
-    }
-
-    fn wait_for_pause(&self) -> MutexGuard<'_, bool> {
-        let guard = self.0.pause_lock.lock().expect("Unable to get pause lock");
-        if self.is_paused() {
-            return guard;
-        }
-
-        self.0
-            .resume_condition
-            .wait_while(guard, |p| !*p)
-            .expect("Expected successful wait until pause")
-    }
-
-    /// Block the current thread until the clock resumes. If the clock is not
-    /// paused when this method is called, the method will return without
-    /// blocking
-    pub fn wait_for_resume(&self) -> PauseGuard {
-        if !self.is_paused_or_pausing() {
-            return PauseGuard::new(&self.0);
-        }
-
-        let guard = self.wait_for_pause();
-
-        let result = PauseGuard::new(&self.0);
-
-        let _lock = self.0.resume_condition.wait_while(guard, |p| *p);
-
-        result
-    }
-
-    pub fn run_unpausable<F, T>(&self, action: F) -> T
-    where
-        F: FnOnce() -> T,
-    {
-        let _guard = self.wait_for_resume();
-        action()
     }
 }
 
