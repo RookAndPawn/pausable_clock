@@ -15,6 +15,14 @@
 //! always increases](https://doc.rust-lang.org/src/std/time.rs.html#238),
 //! `PausableClock` guarantees that the time returned by `clock.now()` while the
 //! clock is paused is >= any other instant returned before the clock was paused.
+//! - Unpausable Tasks: We provide a method called `run_unpausable` that allows
+//! tasks to be run that can prevent the timer from being paused while they are
+//! still running.
+//! - There is a significant amount of weakly-ordered atomic operation going on
+//! in this library to make sure the calls to now and unpausable task don't
+//! require any locks. I can't claim that it is provably correct, but it has
+//! been tested to high degree of certainty on x86_64 processors. Tests on
+//! weakly ordered systems are forthcoming as are `loom`-based tests.
 //!
 //! ## Example
 //!
@@ -183,6 +191,9 @@ impl PausableClock {
     /// pausing, then to paused. This ensures that no times will be read in
     /// the time between when now is read and when the pause state is set that
     /// is greater than the paused time.
+    ///
+    /// Note. This method will block _synchronously_ if there are unpausable
+    /// tasks being run.
     ///
     /// True will be returned for a successful pause (meaning the clock wasn't
     /// already paused), and false will be returned if the clock was paused when
@@ -731,6 +742,32 @@ mod tests {
         clock.pause();
         let time_to_pause = before.elapsed();
 
-        assert!((time_to_pause.as_secs_f64() - 1.).abs() < 0.005);
+        println!("{:?}", time_to_pause);
+
+        assert!(time_to_pause.as_secs_f64() >= 1.);
+    }
+
+    #[test]
+    #[cfg(loom)]
+    fn loom_test_pause_and_unpausable_interaction() {
+        loom::model(|| {
+            let clock = Arc::new(PausableClock::default());
+
+            let clock_clone = clock.clone();
+
+            thread::spawn(move || {
+                clock_clone.pause();
+            });
+
+            let clock_clone = clock.clone();
+
+            thread::spawn(move || {
+                let clock_clone_2 = clock_clone.clone();
+
+                clock_clone.run_unpausable(|| {
+                    assert!(!clock_clone_2.is_paused_ordered(Ordering::Relaxed));
+                });
+            });
+        });
     }
 }
