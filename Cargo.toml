@@ -15,6 +15,13 @@ categories = ["concurrency", "date-and-time"]
 [dev-dependencies]
 criterion = "0.3"
 
+[target.'cfg(loom)'.dependencies]
+loom = "0.3"
+
 [[bench]]
 name = "now_bench"
+harness = false
+
+[[bench]]
+name = "run_unpausable_bench"
 harness = false

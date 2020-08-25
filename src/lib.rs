@@ -81,8 +81,19 @@ use pausability_state::{
 };
 pub use pausable_instant::PausableInstant;
 use pause_state::{PauseState, PauseStateTrait};
+
+#[cfg(loom)]
+use loom::sync::atomic::{compiler_fence, AtomicU32, AtomicU64, Ordering};
+
+#[cfg(loom)]
+use loom::sync::{Condvar, Mutex, MutexGuard};
+
+#[cfg(not(loom))]
 use std::sync::atomic::{compiler_fence, AtomicU32, AtomicU64, Ordering};
+
+#[cfg(not(loom))]
 use std::sync::{Condvar, Mutex, MutexGuard};
+
 use std::time::{Duration, Instant};
 use unpausable_task_guard::UnpausableTaskGuard;
 
@@ -495,9 +506,24 @@ impl PausableClock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicU64};
-    use std::sync::Arc;
+
+    #[cfg(not(loom))]
+    use std::sync::{
+        atomic::{AtomicBool, AtomicU64},
+        Arc, Condvar, Mutex,
+    };
+
+    #[cfg(not(loom))]
     use std::thread;
+
+    #[cfg(loom)]
+    use loom::sync::{
+        atomic::{AtomicBool, AtomicU64},
+        Arc, Condvar, Mutex,
+    };
+
+    #[cfg(loom)]
+    use loom::thread;
 
     #[test]
     fn it_works() {
@@ -639,5 +665,72 @@ mod tests {
             assert!(actual > 0);
             assert!(actual <= expected_max_elapsed);
         }
+    }
+
+    #[test]
+    fn test_unpausable_wont_run_while_paused() {
+        let clock = Arc::new(PausableClock::default());
+
+        clock.pause();
+
+        let clock_clone = clock.clone();
+
+        let counter = Arc::new(AtomicU64::default());
+        let counter_clone = counter.clone();
+
+        thread::spawn(move || {
+            clock_clone.run_unpausable(|| {
+                counter_clone.store(1, Ordering::SeqCst);
+            });
+        });
+
+        thread::sleep(Duration::from_millis(50));
+
+        assert_eq!(0, counter.load(Ordering::SeqCst));
+
+        clock.resume();
+
+        thread::sleep(Duration::from_millis(50));
+
+        assert_eq!(1, counter.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_pause_blocks_until_unpausable_exits() {
+        let clock = Arc::new(PausableClock::default());
+
+        clock.pause();
+
+        let lock = Arc::new(Mutex::new(true));
+        let cond = Arc::new(Condvar::default());
+        let clock_clone = clock.clone();
+        let lock_clone = lock.clone();
+        let cond_clone = cond.clone();
+
+        thread::spawn(move || {
+            clock_clone.run_unpausable(|| {
+                {
+                    let mut lock = lock_clone.lock().unwrap();
+                    *lock = false;
+                }
+
+                cond_clone.notify_all();
+                thread::sleep(Duration::from_millis(1000));
+            });
+        });
+
+        clock.resume();
+
+        let before = Instant::now();
+
+        {
+            let lock = lock.lock().unwrap();
+            let _lock = cond.wait_while(lock, |v| *v);
+        }
+
+        clock.pause();
+        let time_to_pause = before.elapsed();
+
+        assert!((time_to_pause.as_secs_f64() - 1.).abs() < 0.005);
     }
 }
