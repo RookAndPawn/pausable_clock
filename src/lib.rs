@@ -111,6 +111,7 @@ enum CoursePauseState {
     Paused,
     Pausing,
     Resumed,
+    Resuming
 }
 
 /// Enumeration of the possible states of pausability. Normally this is
@@ -156,7 +157,7 @@ impl PausableClock {
         let zero_instant = now - elapsed_time;
 
         let current_state =
-            PauseState::new(true, false, true, elapsed_time.as_millis() as u64);
+            PauseState::new(true, false, true, false, elapsed_time.as_millis() as u64);
 
         let result = PausableClock {
             zero_instant,
@@ -377,6 +378,25 @@ impl PausableClock {
     where
         F: FnOnce() -> T,
     {
+        self.run_paused_blocking_task(true, action).unwrap()
+    }
+
+    /// This method provides a way to run in coordination with the pause
+    /// functionality of the clock. A task run with this method will prevent
+    /// the clock from being paused, but will not be run if the clock is paused
+    pub fn run_if_resumed<F, T>(&self, action: F) -> Option<T>
+    where
+        F: FnOnce() -> T,
+    {
+        self.run_paused_blocking_task(false, action)
+    }
+
+    /// Run the given task in a way that prevents the clock from pausing before
+    /// the task is completed. This method makes waiting until resume optional
+    fn run_paused_blocking_task<F, T>(&self, wait_if_paused: bool, action: F) -> Option<T>
+    where
+        F: FnOnce() -> T
+    {
         // This does a _Acquire_ read and _Relaxed_ write
         let guard_opt = match UnpausableTaskGuard::try_lock(self) {
             Ok(guard) => {
@@ -403,7 +423,9 @@ impl PausableClock {
         };
 
         if let Some(_guard) = guard_opt {
-            action()
+            Some(action())
+        } else if ! wait_if_paused {
+            None
         } else {
             let mut guard_opt = self.wait_for_resume_impl();
 
@@ -414,12 +436,30 @@ impl PausableClock {
                     let _active_guard = guard_opt.take();
                     UnpausableTaskGuard::try_lock(self)
                 };
-                action()
+                Some(action())
             } else {
                 // otherwise we have to start over
-                self.run_unpausable(action)
+                self.run_paused_blocking_task(wait_if_paused, action)
             }
         }
+    }
+
+    /// This method provides a way to run in coordination with the resume
+    /// functionality of the clock. A task run with this method will prevent
+    /// the clock from being resumed, but will not be run if the clock is not
+    /// already paused
+    pub fn run_if_paused<F, T>(&self, action: F) -> Option<T>
+    where
+        F: FnOnce() -> T
+    {
+        self.run_resume_blocking_task(false, action)
+    }
+
+    fn run_resume_blocking_task<F, T>(&self, wait_if_resumed: bool, action: F) -> Option<T>
+    where
+        F: FnOnce() -> T
+    {
+
     }
 
     fn current_state(&self, ordering: Ordering) -> PauseState {
