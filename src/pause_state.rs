@@ -2,7 +2,8 @@ const PAUSED_MASK: u64 = 1 << 63;
 const PAUSING_MASK: u64 = 1 << 62;
 const TIME_FROZEN_MASK: u64 = 1 << 61;
 const RESUMING_MASK: u64 = 1 << 60;
-const FLAG_MASK: u64 = PAUSED_MASK + PAUSING_MASK + TIME_FROZEN_MASK + RESUMING_MASK;
+const FLAG_MASK: u64 =
+    PAUSED_MASK + PAUSING_MASK + TIME_FROZEN_MASK + RESUMING_MASK;
 const ELAPSED_MILLIS_MASK: u64 = !FLAG_MASK;
 
 pub(crate) type PauseState = u64;
@@ -27,6 +28,8 @@ pub(crate) trait PauseStateTrait {
     fn get_millis(&self) -> u64;
 
     fn is_paused_or_pausing(&self) -> bool;
+
+    fn is_resumed_or_resuming(&self) -> bool;
 
     fn is_time_paused(&self) -> bool;
 
@@ -70,6 +73,10 @@ impl PauseStateTrait for PauseState {
 
     fn is_paused_or_pausing(&self) -> bool {
         (*self & PAUSED_MASK) + (*self & PAUSING_MASK) > 0
+    }
+
+    fn is_resumed_or_resuming(&self) -> bool {
+        !self.is_paused_or_pausing()
     }
 
     fn is_time_paused(&self) -> bool {

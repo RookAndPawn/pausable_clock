@@ -82,13 +82,21 @@
 mod pausability_state;
 mod pausable_instant;
 mod pause_state;
+mod resumability_state;
 mod unpausable_task_guard;
+mod unresumable_task_guard;
 
 use pausability_state::{
     PausabilityState, PausabilityStateTrait, PAUSING_REQUESTED_MASK,
 };
 pub use pausable_instant::PausableInstant;
 use pause_state::{PauseState, PauseStateTrait};
+use resumability_state::{
+    ResumabilityState, ResumabilityStateTrait, RESUMING_REQUESTED_MASK,
+};
+use std::time::{Duration, Instant};
+use unpausable_task_guard::UnpausableTaskGuard;
+use unresumable_task_guard::UnresumableTaskGuard;
 
 #[cfg(loom)]
 use loom::sync::atomic::{compiler_fence, AtomicU32, AtomicU64, Ordering};
@@ -102,16 +110,13 @@ use std::sync::atomic::{compiler_fence, AtomicU32, AtomicU64, Ordering};
 #[cfg(not(loom))]
 use std::sync::{Condvar, Mutex, MutexGuard};
 
-use std::time::{Duration, Instant};
-use unpausable_task_guard::UnpausableTaskGuard;
-
 /// Enumeration of the possible pause states of the system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum CoursePauseState {
     Paused,
     Pausing,
     Resumed,
-    Resuming
+    Resuming,
 }
 
 /// Enumeration of the possible states of pausability. Normally this is
@@ -122,6 +127,17 @@ enum CoursePauseState {
 enum CoursePausabilityState {
     Unused,
     Pausing,
+    Released,
+}
+
+/// Enumeration of the possible states of resumability. Normally this is
+/// Unused. During a resume call it gets set to Resuming, and if there are
+/// un-resumable tasks running when the pause call happens, they will set the
+/// state to released.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CourseResumabilityState {
+    Unused,
+    Resuming,
     Released,
 }
 
@@ -139,6 +155,10 @@ pub struct PausableClock {
     pausability_state: AtomicU32,
     pausability_lock: Mutex<CoursePausabilityState>,
     pausability_condition: Condvar,
+
+    resumability_state: AtomicU32,
+    resumability_lock: Mutex<CourseResumabilityState>,
+    resumability_condition: Condvar,
 }
 
 /// The default pausable clock is one that is (more or less) identical to real
@@ -156,8 +176,13 @@ impl PausableClock {
         let now = Instant::now();
         let zero_instant = now - elapsed_time;
 
-        let current_state =
-            PauseState::new(true, false, true, false, elapsed_time.as_millis() as u64);
+        let current_state = PauseState::new(
+            true,
+            false,
+            true,
+            false,
+            elapsed_time.as_millis() as u64,
+        );
 
         let result = PausableClock {
             zero_instant,
@@ -169,6 +194,10 @@ impl PausableClock {
             pausability_state: Default::default(),
             pausability_lock: Mutex::new(CoursePausabilityState::Unused),
             pausability_condition: Default::default(),
+
+            resumability_state: Default::default(),
+            resumability_lock: Mutex::new(CourseResumabilityState::Unused),
+            resumability_condition: Default::default(),
         };
 
         if !paused {
@@ -244,6 +273,7 @@ impl PausableClock {
             false,
             true,
             true,
+            false,
             freeze_instant.elapsed_millis,
         ));
 
@@ -255,7 +285,7 @@ impl PausableClock {
         let frozen_millis =
             self.zero_instant.elapsed().as_millis() as u64 - fake_resume_millis;
 
-        let paused = PauseState::new(true, false, true, frozen_millis);
+        let paused = PauseState::new(true, false, true, false, frozen_millis);
 
         *paused_guard = CoursePauseState::Paused;
         self.set_state(paused);
@@ -270,6 +300,7 @@ impl PausableClock {
             *unpausable_task_guard_lock = CoursePausabilityState::Unused;
         }
 
+        self.pause_state_condition.notify_all();
         true
     }
 
@@ -289,24 +320,66 @@ impl PausableClock {
             .expect("Expected valid return from pausability lock");
     }
 
-    /// Resume the clock and notify any threads waiting on for time to resume.
+    /// Wait on the resumable guard condition to make sure all valid resume
+    /// guards have exited before allowing the resume action to proceed
+    fn wait_for_unresumable_tasks_to_clear(&self) {
+        let unresumable_task_guard_lock = self
+            .resumability_lock
+            .lock()
+            .expect("Failed to get resume guard lock");
+
+        let _lock = self
+            .resumability_condition
+            .wait_while(unresumable_task_guard_lock, |s| {
+                *s != CourseResumabilityState::Released
+            })
+            .expect("Expected valid return from resumability lock");
+    }
+
+    /// Resume the pausable clock. This function will set the pause state to
+    /// resuming, then to resumed.
     ///
-    /// This will return true if the clock started paused and was successfully
-    /// resumed. It will return false if the clock was already resumed
+    /// Note. This method will block _synchronously_ if there are unresumable
+    /// tasks being run.
+    ///
+    /// True will be returned for a successful resume (meaning the clock wasn't
+    /// already resumed), and false will be returned if the clock was resumed
+    /// when this method was called.
     pub fn resume(&self) -> bool {
-        let mut paused_guard = self
+        let mut resumed_guard = self
             .pause_state_lock
             .lock()
             .expect("Failed to get pause lock");
 
-        let starting_state = self.current_state(Ordering::SeqCst);
-
-        if !starting_state.is_paused() {
-            return false;
+        match *resumed_guard {
+            CoursePauseState::Resumed => return false,
+            CoursePauseState::Resuming => {
+                panic!("Inconsistent pause state");
+            }
+            _ => {}
         }
 
-        if starting_state.is_pausing() {
-            panic!("Inconsistent pause state: pausing");
+        *resumed_guard = CoursePauseState::Resuming;
+
+        {
+            let mut resumability_guard = self
+                .resumability_lock
+                .lock()
+                .expect("Failed to get resume guard lock");
+            if *resumability_guard != CourseResumabilityState::Unused {
+                panic!("Inconsistent pausable state");
+            }
+            *resumability_guard = CourseResumabilityState::Resuming;
+        }
+
+        let starting_state = self.current_state(Ordering::SeqCst);
+        let resuming = starting_state.with_pausing_flag();
+
+        self.set_state(resuming);
+        let resumability_state = self.set_resuming_flag_on_guard_state();
+
+        if resumability_state.get_unresumable_task_count() > 0 {
+            self.wait_for_unresumable_tasks_to_clear();
         }
 
         // now - stored - zero = paused_millis
@@ -314,13 +387,25 @@ impl PausableClock {
         let paused_millis = starting_state.get_millis();
         let stored_millis =
             self.zero_instant.elapsed().as_millis() as u64 - paused_millis;
-        let resumed_state = PauseState::new(false, false, false, stored_millis);
+        let resumed_state =
+            PauseState::new(false, false, false, false, stored_millis);
 
-        *paused_guard = CoursePauseState::Resumed;
+        *resumed_guard = CoursePauseState::Resumed;
 
         self.set_state(resumed_state);
-        self.pause_state_condition.notify_all();
 
+        self.unset_resuming_flag_on_guard_state();
+
+        {
+            let mut unresumable_task_guard_lock = self
+                .resumability_lock
+                .lock()
+                .expect("Failed to get resume guard lock");
+
+            *unresumable_task_guard_lock = CourseResumabilityState::Unused;
+        }
+
+        self.pause_state_condition.notify_all();
         true
     }
 
@@ -344,9 +429,8 @@ impl PausableClock {
     /// Block the current thread until the clock resumes. If the clock is not
     /// paused when this method is called, the method will return without
     /// blocking
-    #[allow(clippy::let_underscore_lock)]
     pub fn wait_for_resume(&self) {
-        let _ = self.wait_for_resume_impl();
+        let _guard = self.wait_for_resume_impl();
     }
 
     /// Wait for the clock to resume, or if the clock is already resumed, do
@@ -366,6 +450,27 @@ impl PausableClock {
             .pause_state_condition
             .wait_while(guard, |p| *p != CoursePauseState::Resumed)
             .expect("Failed to reacquire lock on pause state after resume");
+
+        Some(guard)
+    }
+
+    /// Wait for the clock to pause, or if the clock is already paused, do
+    /// nothing. The return for this function is none if no waiting was done,
+    /// and a mutex guard on the pause state if waiting was done.
+    fn wait_for_pause_impl(&self) -> Option<MutexGuard<'_, CoursePauseState>> {
+        if !self.is_resumed_or_resuming_ordered(Ordering::Acquire) {
+            return None;
+        }
+
+        let guard = self
+            .pause_state_lock
+            .lock()
+            .expect("Failed to get pause-state lock");
+
+        let guard = self
+            .pause_state_condition
+            .wait_while(guard, |p| *p != CoursePauseState::Paused)
+            .expect("Failed to reacquire lock on pause state after pause");
 
         Some(guard)
     }
@@ -393,11 +498,14 @@ impl PausableClock {
 
     /// Run the given task in a way that prevents the clock from pausing before
     /// the task is completed. This method makes waiting until resume optional
-    fn run_paused_blocking_task<F, T>(&self, wait_if_paused: bool, action: F) -> Option<T>
+    fn run_paused_blocking_task<F, T>(
+        &self,
+        wait_if_paused: bool,
+        action: F,
+    ) -> Option<T>
     where
-        F: FnOnce() -> T
+        F: FnOnce() -> T,
     {
-        // This does a _Acquire_ read and _Relaxed_ write
         let guard_opt = match UnpausableTaskGuard::try_lock(self) {
             Ok(guard) => {
                 // Another _Acquire_ read here that definitely happens after the
@@ -424,7 +532,7 @@ impl PausableClock {
 
         if let Some(_guard) = guard_opt {
             Some(action())
-        } else if ! wait_if_paused {
+        } else if !wait_if_paused {
             None
         } else {
             let mut guard_opt = self.wait_for_resume_impl();
@@ -446,20 +554,78 @@ impl PausableClock {
 
     /// This method provides a way to run in coordination with the resume
     /// functionality of the clock. A task run with this method will prevent
+    /// the clock from being resumed, and will not be run while the clock is
+    /// resumed
+    pub fn run_unresumable<F, T>(&self, action: F) -> T
+    where
+        F: FnOnce() -> T,
+    {
+        self.run_resume_blocking_task(true, action).unwrap()
+    }
+
+    /// This method provides a way to run in coordination with the resume
+    /// functionality of the clock. A task run with this method will prevent
     /// the clock from being resumed, but will not be run if the clock is not
     /// already paused
     pub fn run_if_paused<F, T>(&self, action: F) -> Option<T>
     where
-        F: FnOnce() -> T
+        F: FnOnce() -> T,
     {
         self.run_resume_blocking_task(false, action)
     }
 
-    fn run_resume_blocking_task<F, T>(&self, wait_if_resumed: bool, action: F) -> Option<T>
+    fn run_resume_blocking_task<F, T>(
+        &self,
+        wait_if_resumed: bool,
+        action: F,
+    ) -> Option<T>
     where
-        F: FnOnce() -> T
+        F: FnOnce() -> T,
     {
+        let guard_opt = match UnresumableTaskGuard::try_lock(self) {
+            Ok(guard) => {
+                // Another _Acquire_ read here that definitely happens after the
+                // read of the pause guard state
+                let pause_state = self.current_state(Ordering::Acquire);
+                if pause_state.is_resumed() {
+                    // Resumed means we couldn't get a guard, but no need to
+                    // release the resumable lock
+                    None
+                } else if pause_state.is_resuming() {
+                    // Resuming means we interrupted the resuming process. We
+                    // can't keep the guard we have, and we need to ensure the
+                    // pausing process is notified when this guard is dropped.
+                    // we do that by setting the resuming flag on the guard
+                    // state ourselves
+                    self.set_resuming_flag_on_guard_state();
+                    None
+                } else {
+                    Some(guard)
+                }
+            }
+            _ => None,
+        };
 
+        if let Some(_guard) = guard_opt {
+            Some(action())
+        } else if !wait_if_resumed {
+            None
+        } else {
+            let mut guard_opt = self.wait_for_pause_impl();
+
+            // If wait for pause was able to return a lock on the pause state,
+            // we can use that to create an infallible pause guard
+            if guard_opt.is_some() {
+                let _unresumable_task_guard = {
+                    let _active_guard = guard_opt.take();
+                    UnpausableTaskGuard::try_lock(self)
+                };
+                Some(action())
+            } else {
+                // otherwise we have to start over
+                self.run_paused_blocking_task(wait_if_resumed, action)
+            }
+        }
     }
 
     fn current_state(&self, ordering: Ordering) -> PauseState {
@@ -489,6 +655,18 @@ impl PausableClock {
                 now,
             )
         }
+    }
+
+    fn set_resuming_flag_on_guard_state(&self) -> ResumabilityState {
+        self.resumability_state
+            .fetch_or(RESUMING_REQUESTED_MASK, Ordering::AcqRel)
+            | RESUMING_REQUESTED_MASK
+    }
+
+    fn unset_resuming_flag_on_guard_state(&self) -> ResumabilityState {
+        self.resumability_state
+            .fetch_and(!RESUMING_REQUESTED_MASK, Ordering::AcqRel)
+            & (!RESUMING_REQUESTED_MASK)
     }
 
     fn set_pausing_flag_on_guard_state(&self) -> PausabilityState {
@@ -524,8 +702,44 @@ impl PausableClock {
         self.current_state(ordering).is_paused_or_pausing()
     }
 
+    /// Check to see if the clock is resumed or resuming using the given atomic
+    /// ordering
+    pub fn is_resumed_or_resuming_ordered(&self, ordering: Ordering) -> bool {
+        self.current_state(ordering).is_resumed_or_resuming()
+    }
+
     fn millis_since_zero(&self, instant: Instant) -> u64 {
         (instant - self.zero_instant).as_millis() as u64
+    }
+
+    pub(crate) fn increment_unresumable_task_guards(
+        &self,
+    ) -> ResumabilityState {
+        self.resumability_state.fetch_add(1, Ordering::Acquire) + 1
+    }
+
+    pub(crate) fn decrement_unresumable_task_guards(
+        &self,
+    ) -> ResumabilityState {
+        let result =
+            self.resumability_state.fetch_sub(1, Ordering::Acquire) - 1;
+
+        if result.get_unresumable_task_count() == 0
+            && result.is_resuming_requested()
+        {
+            {
+                let mut resumability_guard = self
+                    .resumability_lock
+                    .lock()
+                    .expect("Failed to get resume guard lock");
+                if *resumability_guard == CourseResumabilityState::Resuming {
+                    *resumability_guard = CourseResumabilityState::Released;
+                }
+            }
+            self.resumability_condition.notify_all();
+        }
+
+        result
     }
 
     pub(crate) fn increment_unpausable_task_guards(&self) -> PausabilityState {
@@ -750,13 +964,25 @@ mod tests {
     fn test_pause_blocks_until_unpausable_exits() {
         let clock = Arc::new(PausableClock::default());
 
-        clock.pause();
+        clock.resume();
 
         let lock = Arc::new(Mutex::new(true));
         let cond = Arc::new(Condvar::default());
         let clock_clone = clock.clone();
         let lock_clone = lock.clone();
         let cond_clone = cond.clone();
+
+        let if_paused_counter = Arc::new(AtomicU32::default());
+
+        let counter_clone = if_paused_counter.clone();
+
+        thread::spawn(move || {
+            clock_clone.run_if_resumed(move || {
+                counter_clone.fetch_add(1, Ordering::SeqCst);
+            });
+        });
+
+        let clock_clone = clock.clone();
 
         thread::spawn(move || {
             clock_clone.run_unpausable(|| {
@@ -770,7 +996,60 @@ mod tests {
             });
         });
 
-        clock.resume();
+        let before = Instant::now();
+
+        {
+            let lock = lock.lock().unwrap();
+            let _lock = cond.wait_while(lock, |v| *v);
+        }
+
+        assert_eq!(1, if_paused_counter.load(Ordering::SeqCst));
+
+        clock.pause();
+        let time_to_pause = before.elapsed();
+
+        println!("{:?}", time_to_pause);
+
+        assert!(time_to_pause.as_secs_f64() >= 1.);
+
+        clock.run_if_resumed(|| unreachable!());
+    }
+
+    #[test]
+    fn test_resume_blocks_until_unresumable_exits() {
+        let clock = Arc::new(PausableClock::default());
+
+        let lock = Arc::new(Mutex::new(true));
+        let cond = Arc::new(Condvar::default());
+        let clock_clone = clock.clone();
+        let lock_clone = lock.clone();
+        let cond_clone = cond.clone();
+
+        let if_resumed_counter = Arc::new(AtomicU32::default());
+
+        let counter_clone = if_resumed_counter.clone();
+
+        clock.pause();
+
+        thread::spawn(move || {
+            clock_clone.run_if_paused(move || {
+                counter_clone.fetch_add(1, Ordering::SeqCst);
+            });
+        });
+
+        let clock_clone = clock.clone();
+
+        thread::spawn(move || {
+            clock_clone.run_unresumable(|| {
+                {
+                    let mut lock = lock_clone.lock().unwrap();
+                    *lock = false;
+                }
+
+                cond_clone.notify_all();
+                thread::sleep(Duration::from_millis(1000));
+            });
+        });
 
         let before = Instant::now();
 
@@ -779,12 +1058,16 @@ mod tests {
             let _lock = cond.wait_while(lock, |v| *v);
         }
 
-        clock.pause();
-        let time_to_pause = before.elapsed();
+        assert_eq!(1, if_resumed_counter.load(Ordering::SeqCst));
 
-        println!("{:?}", time_to_pause);
+        clock.resume();
+        let time_to_resume = before.elapsed();
 
-        assert!(time_to_pause.as_secs_f64() >= 1.);
+        println!("{:?}", time_to_resume);
+
+        assert!(time_to_resume.as_secs_f64() >= 1.);
+
+        clock.run_if_paused(|| unreachable!());
     }
 
     #[test]

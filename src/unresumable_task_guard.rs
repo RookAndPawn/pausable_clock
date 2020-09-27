@@ -1,5 +1,5 @@
+use super::PausableClock;
 use super::ResumabilityStateTrait;
-use super::ResumableClock;
 
 pub(super) struct UnresumableTaskGuard<'a>(&'a PausableClock);
 
