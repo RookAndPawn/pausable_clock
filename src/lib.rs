@@ -11,13 +11,18 @@
 //! std mutexes
 //! - Resume Notification: the `wait_for_resume` method will block until the
 //! clock is resumed (if the clock is paused)
+//! - Resume Notification: the `wait_for_pause` method will block until the
+//! clock is paused (if the clock is running)
 //! - Guarantees: Just like `std::time::Instant::now()` guarantees that [time
 //! always increases](https://doc.rust-lang.org/src/std/time.rs.html#238),
 //! `PausableClock` guarantees that the time returned by `clock.now()` while the
 //! clock is paused is >= any other instant returned before the clock was paused.
-//! - Unpausable Tasks: We provide a method called `run_unpausable` that allows
-//! tasks to be run that can prevent the timer from being paused while they are
-//! still running.
+//! - Unpausable Tasks: We provide methods called `run_unpausable` and
+//! `run_if_resumed` that allow tasks to be run that can prevent the clock from
+//! being paused while they are still running.
+//! - Unresumable Tasks: We provide a methods `run_unresumable` and
+//! `run_if_paused` that allow tasks to be run that can prevent the clock from
+//! being resumed while they are still running.
 //! - There is a significant amount of weakly-ordered atomic operation going on
 //! in this library to make sure the calls to now and unpausable task don't
 //! require any locks. I can't claim that it is provably correct, but it has
@@ -488,7 +493,10 @@ impl PausableClock {
 
     /// This method provides a way to run in coordination with the pause
     /// functionality of the clock. A task run with this method will prevent
-    /// the clock from being paused, but will not be run if the clock is paused
+    /// the clock from being paused, but will not be run if the clock is paused.
+    /// The turn will contain the result of evaluation of the task if the task
+    /// is run, and will be None if the task was not run (meaning the clock was
+    /// paused)
     pub fn run_if_resumed<F, T>(&self, action: F) -> Option<T>
     where
         F: FnOnce() -> T,
@@ -566,7 +574,9 @@ impl PausableClock {
     /// This method provides a way to run in coordination with the resume
     /// functionality of the clock. A task run with this method will prevent
     /// the clock from being resumed, but will not be run if the clock is not
-    /// already paused
+    /// already paused. The turn will contain the result of evaluation of the
+    /// task if the task is run, and will be None if the task was not run
+    /// (meaning the clock was running)
     pub fn run_if_paused<F, T>(&self, action: F) -> Option<T>
     where
         F: FnOnce() -> T,
