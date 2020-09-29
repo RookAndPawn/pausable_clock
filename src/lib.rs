@@ -438,6 +438,12 @@ impl PausableClock {
         let _guard = self.wait_for_resume_impl();
     }
 
+    /// Block the current thread until the clock pauses. If the clock is paused
+    /// when this method is called, the method will return without blocking
+    pub fn wait_for_pause(&self) {
+        let _guard = self.wait_for_pause_impl();
+    }
+
     /// Wait for the clock to resume, or if the clock is already resumed, do
     /// nothing. The return for this function is none if no waiting was done,
     /// and a mutex guard on the pause state if waiting was done.
