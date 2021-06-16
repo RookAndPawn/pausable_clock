@@ -15,7 +15,7 @@ pub(crate) trait PauseStateTrait {
         time_frozen: bool,
         resuming_flag: bool,
         millis: u64,
-    ) -> PauseState;
+    ) -> Self;
 
     fn is_paused(&self) -> bool;
 
@@ -43,7 +43,7 @@ impl PauseStateTrait for PauseState {
         time_frozen: bool,
         resuming_flag: bool,
         millis: u64,
-    ) -> PauseState {
+    ) -> Self {
         millis
             + if paused { PAUSED_MASK } else { 0 }
             + if pausing { PAUSING_MASK } else { 0 }
@@ -85,5 +85,17 @@ impl PauseStateTrait for PauseState {
 
     fn with_pausing_flag(&self) -> PauseState {
         *self | PAUSING_MASK
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+
+    #[test]
+    fn test_accurate_millis() {
+        let s = PauseState::new(true, false, true, false, 5000);
+        assert_eq!(5000, s.get_millis());
     }
 }

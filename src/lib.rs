@@ -80,7 +80,6 @@
     missing_docs,
     rust_2018_idioms,
     missing_debug_implementations,
-    intra_doc_link_resolution_failure,
     clippy::all
 )]
 
@@ -796,6 +795,7 @@ mod tests {
 
     #[cfg(not(loom))]
     use std::thread;
+    use std::thread::sleep;
 
     #[cfg(loom)]
     use loom::sync::{
@@ -1084,6 +1084,35 @@ mod tests {
         assert!(time_to_resume.as_secs_f64() >= 1.);
 
         clock.run_if_paused(|| unreachable!());
+    }
+
+    #[test]
+    fn test_start_paused() {
+        let clock = Arc::new(PausableClock::new(Duration::from_secs(0), true));
+
+        assert!(clock.is_paused());
+
+        sleep(Duration::from_secs(1));
+
+        assert!(clock.is_paused());
+        assert_eq!(clock.now().elapsed_millis, 0);
+
+        clock.resume();
+
+        clock.run_if_paused(|| panic!("This shouldn't happen"));
+        assert_eq!(Some(42), clock.run_if_resumed(|| 42));
+
+        sleep(Duration::from_secs(1));
+
+        assert!(!clock.is_paused());
+        clock.pause();
+        assert!(clock.is_paused());
+
+        // Make sure the elapsed time shows about a second has passed
+        assert!((clock.now().elapsed_millis as f64 - 1000.).abs() < 100.);
+
+        clock.run_if_resumed(|| panic!("This shouldn't happen"));
+        assert_eq!(Some(42), clock.run_if_paused(|| 42));
     }
 
     #[test]
