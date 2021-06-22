@@ -41,7 +41,7 @@
 //!
 //! // With the default parameters, there should be no difference
 //! // between the real time and the clock's time
-//! assert!(clock.now_std().elapsed().as_millis() == 0);
+//! assert!(Instant::from(clock.now()).elapsed().as_millis() == 0);
 //!
 //! // Pause the clock right after creation
 //! clock.pause();
@@ -65,7 +65,7 @@
 //! t.join().unwrap();
 //!
 //! // After being paused for a second, the clock is now a second behind
-//! assert!((clock.now_std().elapsed().as_secs_f64() - slept).abs() <= 0.001);
+//! assert!((Instant::from(clock.now()).elapsed().as_secs_f64() - slept).abs() <= 0.001);
 //! ```
 //!
 //! ## Caveats
@@ -209,11 +209,6 @@ impl PausableClock {
         }
 
         result
-    }
-
-    /// Get the current time according to this clock as a std instant
-    pub fn now_std(&self) -> Instant {
-        self.now().into()
     }
 
     /// Get the current time according to the clock
@@ -810,7 +805,7 @@ mod tests {
     fn it_works() {
         let clock = Arc::new(PausableClock::default());
 
-        assert!(clock.now_std().elapsed().as_millis() == 0);
+        assert!(clock.now().elapsed_millis() == 0);
 
         clock.pause();
 
@@ -844,7 +839,7 @@ mod tests {
 
         j.join().expect("Must be an assert fail in spawned thread");
 
-        let elapsed = clock.now_std().elapsed();
+        let elapsed = now.elapsed();
 
         assert!((elapsed.as_secs_f64() - slept_millis).abs() <= 0.001);
     }
@@ -1088,7 +1083,7 @@ mod tests {
 
     #[test]
     fn test_start_paused() {
-        let clock = Arc::new(PausableClock::new(Duration::from_secs(0), true));
+        let clock = PausableClock::new(Duration::from_secs(0), true);
 
         assert!(clock.is_paused());
 
