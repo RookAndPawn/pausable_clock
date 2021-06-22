@@ -41,7 +41,7 @@
 //!
 //! // With the default parameters, there should be no difference
 //! // between the real time and the clock's time
-//! assert!(clock.now_std().elapsed().as_millis() == 0);
+//! assert!(Instant::from(clock.now()).elapsed().as_millis() == 0);
 //!
 //! // Pause the clock right after creation
 //! clock.pause();
@@ -65,7 +65,7 @@
 //! t.join().unwrap();
 //!
 //! // After being paused for a second, the clock is now a second behind
-//! assert!((clock.now_std().elapsed().as_secs_f64() - slept).abs() <= 0.001);
+//! assert!((Instant::from(clock.now()).elapsed().as_secs_f64() - slept).abs() <= 0.001);
 //! ```
 //!
 //! ## Caveats
@@ -80,7 +80,6 @@
     missing_docs,
     rust_2018_idioms,
     missing_debug_implementations,
-    intra_doc_link_resolution_failure,
     clippy::all
 )]
 
@@ -210,11 +209,6 @@ impl PausableClock {
         }
 
         result
-    }
-
-    /// Get the current time according to this clock as a std instant
-    pub fn now_std(&self) -> Instant {
-        self.now().into()
     }
 
     /// Get the current time according to the clock
@@ -796,6 +790,7 @@ mod tests {
 
     #[cfg(not(loom))]
     use std::thread;
+    use std::thread::sleep;
 
     #[cfg(loom)]
     use loom::sync::{
@@ -810,7 +805,7 @@ mod tests {
     fn it_works() {
         let clock = Arc::new(PausableClock::default());
 
-        assert!(clock.now_std().elapsed().as_millis() == 0);
+        assert!(clock.now().elapsed_millis() == 0);
 
         clock.pause();
 
@@ -844,7 +839,7 @@ mod tests {
 
         j.join().expect("Must be an assert fail in spawned thread");
 
-        let elapsed = clock.now_std().elapsed();
+        let elapsed = now.elapsed();
 
         assert!((elapsed.as_secs_f64() - slept_millis).abs() <= 0.001);
     }
@@ -1084,6 +1079,35 @@ mod tests {
         assert!(time_to_resume.as_secs_f64() >= 1.);
 
         clock.run_if_paused(|| unreachable!());
+    }
+
+    #[test]
+    fn test_start_paused() {
+        let clock = PausableClock::new(Duration::from_secs(0), true);
+
+        assert!(clock.is_paused());
+
+        sleep(Duration::from_secs(1));
+
+        assert!(clock.is_paused());
+        assert_eq!(clock.now().elapsed_millis, 0);
+
+        clock.resume();
+
+        clock.run_if_paused(|| panic!("This shouldn't happen"));
+        assert_eq!(Some(42), clock.run_if_resumed(|| 42));
+
+        sleep(Duration::from_secs(1));
+
+        assert!(!clock.is_paused());
+        clock.pause();
+        assert!(clock.is_paused());
+
+        // Make sure the elapsed time shows about a second has passed
+        assert!((clock.now().elapsed_millis as f64 - 1000.).abs() < 100.);
+
+        clock.run_if_resumed(|| panic!("This shouldn't happen"));
+        assert_eq!(Some(42), clock.run_if_paused(|| 42));
     }
 
     #[test]
