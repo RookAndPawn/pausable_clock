@@ -14,13 +14,13 @@ This crate provides a clock that can be paused ... (duh?). The provided struct `
 use pausable_clock::PausableClock;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 let clock = Arc::new(PausableClock::default());
 
 // With the default parameters, there should be no difference
 // between the real time and the clock's time
-assert!(clock.now_std().elapsed().as_millis() == 0);
+assert!(Instant::from(clock.now()).elapsed().as_millis() == 0);
 
 // Pause the clock right after creation
 clock.pause();
@@ -42,7 +42,7 @@ t.join().unwrap();
 
 // After being paused for a second, the clock is now a second behind
 // (with a small error margin here because sleep is not super accurate)
-assert!((clock.now_std().elapsed().as_secs_f64() - 1.).abs() < 0.005);
+assert!((Instant::from(clock.now()).elapsed().as_secs_f64() - 1.).abs() < 0.005);
 ```
 
 ## Caveats
