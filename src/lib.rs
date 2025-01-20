@@ -108,8 +108,11 @@ use loom::sync::atomic::{compiler_fence, AtomicU32, AtomicU64, Ordering};
 #[cfg(loom)]
 use loom::sync::{Condvar, Mutex, MutexGuard};
 
-#[cfg(not(loom))]
+#[cfg(all(not(loom), not(feature = "portable")))]
 use std::sync::atomic::{compiler_fence, AtomicU32, AtomicU64, Ordering};
+
+#[cfg(feature = "portable")]
+use portable_atomic::{compiler_fence, AtomicU32, AtomicU64, Ordering};
 
 #[cfg(not(loom))]
 use std::sync::{Condvar, Mutex, MutexGuard};
@@ -783,20 +786,20 @@ mod tests {
     use super::*;
 
     #[cfg(not(loom))]
-    use std::sync::{
-        atomic::{AtomicBool, AtomicU64},
-        Arc, Condvar, Mutex,
+    use std::{
+        sync::{Arc, Condvar, Mutex},
+        thread,
+        thread::sleep,
     };
 
-    #[cfg(not(loom))]
-    use std::thread;
-    use std::thread::sleep;
+    #[cfg(all(not(loom), not(feature = "portable")))]
+    use std::sync::atomic::AtomicBool;
+
+    #[cfg(feature = "portable")]
+    use portable_atomic::AtomicBool;
 
     #[cfg(loom)]
-    use loom::sync::{
-        atomic::{AtomicBool, AtomicU64},
-        Arc, Condvar, Mutex,
-    };
+    use loom::sync::{atomic::AtomicBool, Arc, Condvar, Mutex};
 
     #[cfg(loom)]
     use loom::thread;
