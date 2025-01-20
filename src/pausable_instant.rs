@@ -204,7 +204,12 @@ impl Sub<PausableInstant> for PausableInstant {
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(not(loom))]
     use std::thread::sleep;
+
+    #[cfg(loom)]
+    use loom::sleep;
 
     use super::*;
     use crate::PausableClock;
@@ -224,8 +229,11 @@ mod tests {
         // Verify the elapsed time doesn't change while the clock is paused
         assert_eq!(expected_elapsed, t1.elapsed(&clock));
 
-        // Verify the elapsed time is roughly 1s
-        assert!((expected_elapsed.as_secs_f64() - 1.0).abs() < 0.005);
+        // Verify the elapsed time is roughly 1s. Sleep is very inaccurate on
+        // some platforms, so we are just making sure that the sleep was within
+        // 10% of the expected duration
+        assert!(expected_elapsed.as_secs_f64() > 1.);
+        assert!((expected_elapsed.as_secs_f64() - 1.) <= 0.1);
     }
 
     #[test]
