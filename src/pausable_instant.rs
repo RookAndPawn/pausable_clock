@@ -1,6 +1,10 @@
 use std::convert::TryFrom;
 use std::ops::{Add, AddAssign, Sub, SubAssign};
+#[cfg(not(feature = "web-time"))]
 use std::time::{Duration, Instant};
+
+#[cfg(feature = "web-time")]
+use web_time::{Duration, Instant};
 
 use crate::PausableClock;
 

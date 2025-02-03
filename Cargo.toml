@@ -12,16 +12,29 @@ categories = ["concurrency", "date-and-time"]
 
 [dependencies]
 portable-atomic = { version="1.10.0", optional = true }
+web-time = { version = "1.1.0", optional = true }
+document-features = { version = "0.2", optional = true }
 
 [dev-dependencies]
-criterion = "0.3"
+criterion = "0.5.1"
 
 [target.'cfg(loom)'.dependencies]
-loom = "0.5.0"
+loom = "0.7.2"
 
 [features]
 default = []
-portable = ["portable-atomic"]
+
+## For platforms where `std::sync::atomic` is not available, you can enable this
+## feature to use atomic primitives from 
+## [`portable-atomic`](https://crates.io/crates/portable-atomic) instead
+portable_atomic = ["portable-atomic"]
+
+## For platforms where `std::time` is not available (like WASM), you can enable 
+## this feature to use time primitives from 
+## [`web-time`](https://crates.io/crates/web-time) instead
+web_time = ["web-time"]
+
+features = ["document-features"]
 
 [[bench]]
 name = "now_bench"

@@ -76,6 +76,10 @@
 //! - Reads of the pause state for `PausableClock::is_paused` is done atomically
 //! with `Ordering::Relaxed`. That allows the call to be slightly faster, but it
 //! means you shouldn't think it as fencing a operations
+#![cfg_attr(
+    feature = "document-features",
+    cfg_attr(doc, doc = ::document_features::document_features!())
+)]
 #![warn(
     missing_docs,
     rust_2018_idioms,
@@ -98,7 +102,13 @@ use pause_state::{PauseState, PauseStateTrait};
 use resumability_state::{
     ResumabilityState, ResumabilityStateTrait, RESUMING_REQUESTED_MASK,
 };
+
+#[cfg(not(feature = "web-time"))]
 use std::time::{Duration, Instant};
+
+#[cfg(feature = "web-time")]
+use web_time::{Duration, Instant};
+
 use unpausable_task_guard::UnpausableTaskGuard;
 use unresumable_task_guard::UnresumableTaskGuard;
 
